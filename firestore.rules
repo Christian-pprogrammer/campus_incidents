@@ -1,0 +1,82 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function aluAccount() {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email.matches('.*@(alustudent|alueducation)[.]com$');
+    }
+
+    function isStaff() {
+      return aluAccount()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'staff';
+    }
+
+    function validNewIncident() {
+      let data = request.resource.data;
+      return data.reporterId == request.auth.uid
+        && data.status == 'submitted'
+        && data.title is string && data.title.size() >= 5 && data.title.size() <= 80
+        && data.description is string && data.description.size() >= 15 && data.description.size() <= 1000
+        && data.category in ['facilities', 'water', 'electricity', 'furniture', 'sanitation', 'safety']
+        && data.location is string && data.location.size() > 0
+        && data.photoCount is int && data.photoCount >= 0 && data.photoCount <= 3
+        && data.affectedBy is list && data.affectedBy.size() == 0;
+    }
+
+    function onlyTogglesOwnAffected() {
+      let added = request.resource.data.affectedBy.removeAll(resource.data.affectedBy);
+      let removed = resource.data.affectedBy.removeAll(request.resource.data.affectedBy);
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['affectedBy'])
+        && added.hasOnly([request.auth.uid])
+        && removed.hasOnly([request.auth.uid]);
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn() && (request.auth.uid == userId || isStaff());
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.role == 'student'
+        && request.resource.data.email == request.auth.token.email;
+      allow update: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['fullName', 'program']);
+      allow delete: if false;
+    }
+
+    match /incidents/{incidentId} {
+      allow read: if aluAccount();
+      allow create: if aluAccount() && validNewIncident();
+      allow update: if isStaff()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'history', 'updatedAt'])
+        && request.resource.data.status in ['submitted', 'inProgress', 'resolved'];
+      allow update: if aluAccount()
+        && resource.data.reporterId != request.auth.uid
+        && onlyTogglesOwnAffected();
+      allow delete: if isStaff()
+        || (aluAccount() && resource.data.reporterId == request.auth.uid && resource.data.status == 'submitted');
+
+      // Photos are written in the same batch as their incident, so creation
+      // checks the incident as it will exist after the batch.
+      match /photos/{photoId} {
+        allow read: if aluAccount();
+        allow create: if aluAccount()
+          && getAfter(/databases/$(database)/documents/incidents/$(incidentId)).data.reporterId == request.auth.uid
+          && !exists(/databases/$(database)/documents/incidents/$(incidentId))
+          && int(photoId) < getAfter(/databases/$(database)/documents/incidents/$(incidentId)).data.photoCount
+          && request.resource.data.keys().hasOnly(['bytes'])
+          && request.resource.data.bytes is bytes
+          && request.resource.data.bytes.size() <= 900 * 1024;
+        allow update: if false;
+        allow delete: if isStaff()
+          || (aluAccount() && get(/databases/$(database)/documents/incidents/$(incidentId)).data.reporterId == request.auth.uid);
+      }
+    }
+  }
+}
